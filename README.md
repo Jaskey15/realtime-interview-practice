@@ -1,6 +1,6 @@
 # Realtime Interview Practice
 
-A voice-based technical interview practice app. Talk to an AI interviewer in real time, then get structured written feedback on your performance.
+A voice-based interview practice app. Talk to an AI interviewer in real time, then get structured written feedback on your performance.
 
 Built on the [OpenAI Realtime API](https://platform.openai.com/docs/guides/realtime) (via WebRTC) for the live interview, and GPT-5.1 for post-interview grading.
 
