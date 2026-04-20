@@ -4,6 +4,8 @@ A voice-based technical interview practice app. Talk to an AI interviewer in rea
 
 Built on the [OpenAI Realtime API](https://platform.openai.com/docs/guides/realtime) (via WebRTC) for the live interview, and GPT-5.1 for post-interview grading.
 
+![Landing page](docs/images/landing.png)
+
 ## How it works
 
 1. Paste a job description, pick an interview type (behavioral, technical, system design, etc.), style, and duration.
