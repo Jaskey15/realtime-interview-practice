@@ -4,7 +4,10 @@ A voice-based technical interview practice app. Talk to an AI interviewer in rea
 
 Built on the [OpenAI Realtime API](https://platform.openai.com/docs/guides/realtime) (via WebRTC) for the live interview, and GPT-5.1 for post-interview grading.
 
-![Landing page](docs/images/landing.png)
+<p align="center">
+  <img src="docs/images/landing.png" alt="Landing page" width="48%" />
+  <img src="docs/images/feedback.png" alt="Feedback report" width="48%" />
+</p>
 
 ## How it works
 
