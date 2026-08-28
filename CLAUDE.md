@@ -21,9 +21,13 @@ Voice-based technical interview practice app. OpenAI Realtime API for live inter
 - Voice interview: OpenAI Realtime API via WebRTC + server VAD
 - Grading: GPT-5.1 via OpenAI API, server-side API route
 - Sessions are ephemeral — no DB, state lives in React, export for persistence
+- Video interviewer: HeyGen LiveAvatar LITE renders a lip-synced avatar from the
+  OpenAI Realtime audio stream; orb UI is the automatic fallback if video fails
 
 ## Environment
 
 Requires in `.env.local`:
 - `OPENAI_API_KEY`
+- `HEYGEN_API_KEY` — LiveAvatar API key (video interviewer; optional, falls back to voice-only)
+- `HEYGEN_AVATAR_ID` — stock avatar UUID (or `HEYGEN_SANDBOX=true` for free dev sessions)
 
