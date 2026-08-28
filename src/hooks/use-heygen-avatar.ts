@@ -103,14 +103,14 @@ export function useHeygenAvatar() {
   }, []);
 
   const connect = useCallback(
-    async (durationMinutes: number): Promise<void> => {
+    async (durationMinutes: number, interviewType: string): Promise<void> => {
       stoppingRef.current = false;
       setStatus("connecting");
       try {
         const res = await fetch("/api/heygen/session", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ durationMinutes }),
+          body: JSON.stringify({ durationMinutes, interviewType }),
         });
         if (!res.ok) throw new Error("Failed to get avatar session token");
         const { sessionToken } = await res.json();

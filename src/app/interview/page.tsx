@@ -115,7 +115,7 @@ export default function InterviewPage() {
     (cfg: InterviewConfig) => {
       startedRef.current = true;
       connect(cfg);
-      connectAvatar(cfg.durationMinutes); // parallel; failure just means orb fallback
+      connectAvatar(cfg.durationMinutes, cfg.interviewType); // parallel; failure just means orb fallback
     },
     [connect, connectAvatar],
   );
