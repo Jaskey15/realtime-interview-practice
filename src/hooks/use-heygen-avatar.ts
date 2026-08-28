@@ -65,14 +65,21 @@ export function useHeygenAvatar() {
     sessionRef.current = null;
   }, []);
 
-  /** Ends the session server-side; safe to call repeatedly. */
-  const disconnect = useCallback(() => {
-    const session = sessionRef.current;
-    stoppingRef.current = true;
-    teardown();
-    session?.stop().catch(() => {});
-    setStatus("idle");
-  }, [teardown]);
+  /**
+   * Ends the session server-side; safe to call repeatedly. Pass "failed" when the
+   * shutdown should surface the video-unavailable fallback UI (e.g. the page's
+   * start deadline expired before the stream became ready).
+   */
+  const disconnect = useCallback(
+    (finalStatus: "idle" | "failed" = "idle") => {
+      const session = sessionRef.current;
+      stoppingRef.current = true;
+      teardown();
+      session?.stop().catch(() => {});
+      setStatus(finalStatus);
+    },
+    [teardown],
+  );
 
   // Unmount safety: never leave a billable session running. Set stoppingRef even
   // when no session exists yet — connect() may still be mid-flight (e.g. awaiting
