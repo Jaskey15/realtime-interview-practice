@@ -14,6 +14,8 @@ export function InterviewView({
   status,
   transcripts,
   audioLevel,
+  avatarStatus,
+  onVideoElement,
   onConnect,
   onEnd,
 }: {
@@ -21,6 +23,8 @@ export function InterviewView({
   status: string;
   transcripts: TranscriptEntry[];
   audioLevel: number;
+  avatarStatus: string;
+  onVideoElement: (el: HTMLVideoElement | null) => void;
   onConnect: (config: InterviewConfig) => void;
   onEnd: () => void;
 }) {
@@ -126,23 +130,41 @@ export function InterviewView({
         </div>
       )}
 
-      {/* Morphing blob orb */}
-      <div className="relative flex items-center justify-center" style={{ width: 200, height: 200 }}>
-        <div
-          style={{
-            width: 120,
-            height: 120,
-            borderRadius: "50%",
-            background: `radial-gradient(circle at 35% 35%, rgba(34, 211, 238, 0.25), rgba(61, 139, 253, 0.15) 60%, rgba(61, 139, 253, 0.05))`,
-            border: "1px solid rgba(34, 211, 238, 0.2)",
-            transform: `scale(${started ? orbScale : 1})`,
-            boxShadow: started
-              ? `0 0 ${glowIntensity}px rgba(34, 211, 238, ${0.15 + audioLevel * 0.25}), 0 0 ${glowIntensity * 2}px rgba(61, 139, 253, ${0.05 + audioLevel * 0.1}), inset 0 0 ${glowIntensity * 0.5}px rgba(34, 211, 238, ${audioLevel * 0.15})`
-              : "0 0 20px rgba(34, 211, 238, 0.08), inset 0 0 10px rgba(34, 211, 238, 0.05)",
-            transition: "transform 0.15s ease-out, box-shadow 0.15s ease-out",
-          }}
-        />
-      </div>
+      {/* Interviewer: video avatar, orb as fallback */}
+      {avatarStatus === "active" ? (
+        <div className="relative overflow-hidden rounded-2xl border border-border-subtle shadow-[0_0_40px_rgba(34,211,238,0.1)]">
+          <video
+            ref={onVideoElement}
+            autoPlay
+            playsInline
+            className="h-auto w-[min(560px,85vw)] bg-black"
+          />
+        </div>
+      ) : (
+        <div className="relative flex items-center justify-center" style={{ width: 200, height: 200 }}>
+          <div
+            style={{
+              width: 120,
+              height: 120,
+              borderRadius: "50%",
+              background: `radial-gradient(circle at 35% 35%, rgba(34, 211, 238, 0.25), rgba(61, 139, 253, 0.15) 60%, rgba(61, 139, 253, 0.05))`,
+              border: "1px solid rgba(34, 211, 238, 0.2)",
+              transform: `scale(${started ? orbScale : 1})`,
+              boxShadow: started
+                ? `0 0 ${glowIntensity}px rgba(34, 211, 238, ${0.15 + audioLevel * 0.25}), 0 0 ${glowIntensity * 2}px rgba(61, 139, 253, ${0.05 + audioLevel * 0.1}), inset 0 0 ${glowIntensity * 0.5}px rgba(34, 211, 238, ${audioLevel * 0.15})`
+                : "0 0 20px rgba(34, 211, 238, 0.08), inset 0 0 10px rgba(34, 211, 238, 0.05)",
+              transition: "transform 0.15s ease-out, box-shadow 0.15s ease-out",
+            }}
+          />
+        </div>
+      )}
+
+      {/* Quiet fallback notice: only when video was expected but died mid-interview */}
+      {started && (avatarStatus === "failed" || avatarStatus === "stopped") && (
+        <div className="absolute bottom-24 left-0 right-0 text-center text-xs text-text-muted">
+          Video unavailable — continuing in voice mode
+        </div>
+      )}
 
       {/* Floating controls — bottom center */}
       <div className="absolute bottom-8 left-0 right-0 flex justify-center">
