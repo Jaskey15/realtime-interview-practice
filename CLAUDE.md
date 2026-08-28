@@ -29,5 +29,6 @@ Voice-based technical interview practice app. OpenAI Realtime API for live inter
 Requires in `.env.local`:
 - `OPENAI_API_KEY`
 - `HEYGEN_API_KEY` — LiveAvatar API key (video interviewer; optional, falls back to voice-only)
-- `HEYGEN_AVATAR_ID` — stock avatar UUID (or `HEYGEN_SANDBOX=true` for free dev sessions)
+- `HEYGEN_SANDBOX=true` for free dev sessions; avatars are mapped per interview type
+  in the heygen session route (`HEYGEN_AVATAR_ID` overrides with a single avatar)
 

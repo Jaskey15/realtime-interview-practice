@@ -47,10 +47,11 @@ Open [http://localhost:3000](http://localhost:3000). Grant microphone permission
 
 A single `OPENAI_API_KEY` powers both the Realtime session and the grader.
 
-Optional video interviewer: set `HEYGEN_API_KEY` (and `HEYGEN_AVATAR_ID`, or
-`HEYGEN_SANDBOX=true` for free dev sessions) to render a lip-synced
-[HeyGen LiveAvatar](https://liveavatar.com) instead of the orb. Without it, the
-app runs voice-only.
+Optional video interviewer: set `HEYGEN_API_KEY` (plus `HEYGEN_SANDBOX=true` for
+free dev sessions) to render a lip-synced [HeyGen LiveAvatar](https://liveavatar.com)
+instead of the orb. Avatars are mapped per interview type in the heygen session
+route; `HEYGEN_AVATAR_ID` overrides the map with a single avatar. Without a key,
+the app runs voice-only.
 
 ## Development
 
