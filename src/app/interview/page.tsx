@@ -61,6 +61,16 @@ export default function InterviewPage() {
     }
   }, [config, router]);
 
+  // If the realtime connection dies after Begin (mic denied, handshake failure,
+  // mid-interview drop), don't leave a billable avatar session running with no
+  // way to stop it (the End button is disabled unless realtime is connected).
+  const startedRef = useRef(false);
+  useEffect(() => {
+    if (startedRef.current && (status === "error" || status === "idle")) {
+      disconnectAvatar();
+    }
+  }, [status, disconnectAvatar]);
+
   // Without the audio bridge the avatar can never receive audio — shut it down.
   useEffect(() => {
     if (bridgeAvailable === false && (avatarStatus === "connecting" || avatarStatus === "active")) {
@@ -92,12 +102,18 @@ export default function InterviewPage() {
       startConversation();
       return;
     }
-    const t = setTimeout(startConversation, AVATAR_START_DEADLINE_MS);
+    const t = setTimeout(() => {
+      // The deadline is definitive: an avatar that becomes ready after the
+      // opening response has started must not mute OpenAI mid-utterance.
+      disconnectAvatar("failed");
+      startConversation();
+    }, AVATAR_START_DEADLINE_MS);
     return () => clearTimeout(t);
-  }, [status, avatarSettled, bridgeAvailable, startConversation]);
+  }, [status, avatarSettled, bridgeAvailable, startConversation, disconnectAvatar]);
 
   const handleConnect = useCallback(
     (cfg: InterviewConfig) => {
+      startedRef.current = true;
       connect(cfg);
       connectAvatar(cfg.durationMinutes); // parallel; failure just means orb fallback
     },
