@@ -74,11 +74,13 @@ export function useHeygenAvatar() {
     setStatus("idle");
   }, [teardown]);
 
-  // Unmount safety: never leave a billable session running.
+  // Unmount safety: never leave a billable session running. Set stoppingRef even
+  // when no session exists yet — connect() may still be mid-flight (e.g. awaiting
+  // the token fetch) and must not proceed to start a session after unmount.
   useEffect(() => {
     return () => {
+      stoppingRef.current = true;
       if (sessionRef.current) {
-        stoppingRef.current = true;
         sessionRef.current.stop().catch(() => {});
       }
       teardown();
@@ -105,6 +107,10 @@ export function useHeygenAvatar() {
         });
         if (!res.ok) throw new Error("Failed to get avatar session token");
         const { sessionToken } = await res.json();
+
+        // disconnect()/unmount may have fired while awaiting the fetch above; no
+        // session existed yet for them to stop, so bail out before creating one.
+        if (stoppingRef.current) return;
 
         const session = new LiteAudioSession(sessionToken, { voiceChat: false });
         sessionRef.current = session;
@@ -135,6 +141,15 @@ export function useHeygenAvatar() {
 
         await session.start();
 
+        // disconnect()/unmount may have fired while awaiting start(); the session
+        // now exists, so stop it (it's real and billable) rather than leaving it
+        // running, and skip arming the watchdog/keep-alive.
+        if (stoppingRef.current) {
+          session.stop().catch(() => {});
+          teardown();
+          return;
+        }
+
         // Stream must become ready promptly or we fall back.
         watchdogRef.current = setTimeout(() => {
           if (!streamReadyRef.current && !stoppingRef.current) {
@@ -147,6 +162,9 @@ export function useHeygenAvatar() {
 
         keepAliveRef.current = setInterval(() => {
           sessionRef.current?.keepAlive().catch(() => {
+            // A concurrent disconnect() may have already torn this down and set
+            // status to "idle" — don't let a late rejection flip it to "stopped".
+            if (stoppingRef.current) return;
             teardown();
             setStatus("stopped");
           });
