@@ -43,6 +43,12 @@ Two independent client connections:
   the provider's responsibility, not ours.
 - On user barge-in (OpenAI response cancellation / output audio buffer events), send
   `agent.interrupt` so the face stops talking with the voice.
+- The first interviewer response is deferred until the avatar stream is ready or has
+  definitively failed (capped at ~10 s), so the opening utterance never switches
+  renderers mid-sentence. Interview timing/wrap-up logic is otherwise unchanged.
+- If the audio bridge itself cannot initialize (AudioWorklet unsupported/failed),
+  the app degrades to voice-only mode — bridge failure must never break the
+  OpenAI connection.
 
 ### Expected latency
 
@@ -54,8 +60,10 @@ interview practice; validated in the end-to-end acceptance run.
 
 - **`src/hooks/use-heygen-avatar.ts` (new):** owns the HeyGen session lifecycle.
   Fetches a session token from the server route, opens the WebSocket + video
-  connection, exposes `sendAudioChunk`, `interrupt`, `status`, and a `videoStream`.
-  Mirrors the shape of `use-realtime`.
+  connection, exposes `sendAudioChunk`, `interrupt`, `status`, and a
+  `setVideoElement` attach callback (the provider SDK attaches its synchronized
+  media tracks to the supplied `<video>` element). Mirrors the shape of
+  `use-realtime`.
 - **`src/app/api/heygen/session/route.ts` (new):** server-side exchange of
   `HEYGEN_API_KEY` for a short-lived session token. Same pattern as
   `/api/realtime/session`.
