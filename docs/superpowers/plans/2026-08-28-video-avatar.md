@@ -123,6 +123,26 @@ Decision rule, in order of preference:
 
 Record the chosen strategy; Tasks 5–7 reference it as **THE STRATEGY**.
 
+> **SPIKE RESULT (recorded 2026-08-28, SDK v0.0.18):** Strategy **(a)** via subclass.
+> Findings from `lib/LiveAvatarSession/LiveAvatarSession.js`:
+> - `repeatAudio()` splits its input into ~960-char slices and sends each as
+>   `{"type":"agent.speak","event_id":<one per call>,"audio":<slice>}`, then sends ONE
+>   `{"type":"agent.speak_end","event_id":<same>}` — i.e., one full speak sequence per
+>   call. Calling it per 1 s chunk WOULD fragment utterances. Do not use it for streaming.
+> - `_sessionEventSocket: WebSocket | null` is **protected**, so a small subclass
+>   (`LiteAudioSession extends LiveAvatarSession`) can implement:
+>   `speakAudioChunk(base64)` → send `{"type":"agent.speak","event_id":<utteranceId>,"audio":base64}`
+>   (reuse one `event_id` per utterance, new UUID after each speak-end/interrupt), and
+>   `speakEnd()` → send `{"type":"agent.speak_end","event_id":<utteranceId>}`.
+>   Guard both on socket presence + `readyState === WebSocket.OPEN`; drop silently if not open.
+> - Event names ARE exported enums: `SessionEvent.SESSION_STREAM_READY` ("session.stream_ready"),
+>   `SessionEvent.SESSION_DISCONNECTED` ("session.disconnected"),
+>   `AgentEventsEnum.SESSION_STOPPED` ("session.stopped", payload has `stop_reason`).
+>   Use enum imports in Task 6, and `session.on(SessionEvent..., handler)`.
+> - Therefore in Task 6: `sendAudioChunk` → `speakAudioChunk`; `endOfSpeech` →
+>   `speakEnd()` (NOT a no-op); `interrupt()` unchanged (public method already sends
+>   `agent.interrupt` over the socket).
+
 - [ ] **Step 3: Commit (only if plan file was annotated)**
 
 ```bash
