@@ -4,18 +4,20 @@
 
 **Goal:** Replace the audio-reactive orb with a photorealistic HeyGen LiveAvatar (LITE mode) lip-synced from the existing OpenAI Realtime audio stream, with the orb retained as a failure fallback.
 
-**Architecture:** The browser keeps its existing WebRTC connection to OpenAI Realtime (mic, VAD, data channel — unchanged). A new hook opens a second session to HeyGen LiveAvatar via the official `@heygen/liveavatar-web-sdk` (LiveKit video under the hood). An AudioWorklet taps the OpenAI remote audio track at 24 kHz, converts to PCM16 base64, and feeds it to the avatar via `repeatAudio()`; the browser plays HeyGen's returned synchronized audio+video while the OpenAI `<audio>` element is muted. Barge-in triggers `interrupt()`. Any avatar failure falls back to the orb + unmuted OpenAI audio.
+**Architecture:** The browser keeps its existing WebRTC connection to OpenAI Realtime (mic, VAD, data channel — unchanged). A new hook opens a second session to HeyGen LiveAvatar via the official `@heygen/liveavatar-web-sdk` (LiveKit video under the hood). An AudioWorklet taps the OpenAI remote audio track at 24 kHz, converts to PCM16 base64, and feeds it to the avatar; the browser plays HeyGen's returned synchronized audio+video while the OpenAI `<audio>` element is muted. Barge-in triggers `interrupt()`. Any avatar or bridge failure falls back to the orb + unmuted OpenAI audio — a face failure must never break the interview. The first AI response is deferred until the avatar is ready or definitively failed (10 s cap) so the opening sentence doesn't switch renderers mid-utterance.
 
 **Tech Stack:** Next.js 16, React 19, TypeScript, `@heygen/liveavatar-web-sdk` (v0.0.x), AudioWorklet, Vitest (new, for pure PCM utils only).
 
 **Spec:** `docs/superpowers/specs/2026-08-28-video-avatar-design.md`
+**Plan review:** `docs/superpowers/reviews/2026-08-28-video-avatar-plan-review.md` (findings incorporated)
 
 **Key external API facts (verified 2026-08-28 against docs.liveavatar.com):**
 - Server mints a session token: `POST https://api.liveavatar.com/v1/sessions/token`, header `X-API-KEY`, body `{"mode":"LITE","avatar_id":"<uuid>", ...}` → `{ "data": { "session_id", "session_token" } }`.
 - Browser SDK: `new LiveAvatarSession(sessionToken, { voiceChat: false })`; `await session.start()` (calls `/v1/sessions/start` itself, joins LiveKit, connects event WebSocket); `session.attach(videoEl)` after the `session.stream_ready` event; `session.repeatAudio(base64Pcm)` sends `agent.speak` chunks + `agent.speak_end`; `session.interrupt()`; `session.keepAlive()`; `session.stop()`.
 - Audio format: raw PCM, 16-bit signed LE, **24,000 Hz**, mono, base64 — identical to OpenAI Realtime output. Recommended ~1 s per chunk, max 1 MB per packet.
+- LITE WebSocket wire events (relevant if the raw-WS contingency is needed): `{"type":"agent.speak","audio":"<b64>"}` per chunk, one `{"type":"agent.speak_end"}` at utterance end, `{"type":"agent.interrupt"}`.
 - Idle timeout 5 min (reset via `keepAlive()`); sandbox mode (`is_sandbox: true`) is free, ~1 min sessions, fixed avatar `dd73ea75-1218-4ef3-92ce-606d5f7fbc0a` (Wayne) — use for integration testing; free tier is only 10 LITE minutes/month.
-- Session end reasons include `NO_CREDITS`, `MAX_SESSION_DURATION_REACHED`, `IDLE_TIMEOUT` — all must trigger orb fallback, not interview death.
+- Session end reasons include `NO_CREDITS`, `MAX_DURATION_REACHED`, `IDLE_TIMEOUT` — all must trigger orb fallback, not interview death.
 - SDK events (from package `.d.ts` v0.0.18): `session.state_changed` (`INACTIVE|CONNECTING|CONNECTED|DISCONNECTING|DISCONNECTED`), `session.stream_ready`, `session.disconnected`. **The executing engineer must confirm exact event-name exports in `node_modules/@heygen/liveavatar-web-sdk/dist/*.d.ts` after install and adjust imports if they differ.**
 - OpenAI Realtime WebRTC data-channel events used for gating: `output_audio_buffer.started` (AI audio playout begins), `output_audio_buffer.stopped` (playout finished), `output_audio_buffer.cleared` (barge-in/interruption).
 
@@ -24,10 +26,28 @@
 - Create: `public/pcm-capture-worklet.js` — AudioWorklet processor posting Float32 frames
 - Create: `src/app/api/heygen/session/route.ts` — mints LiveAvatar session token
 - Create: `src/hooks/use-heygen-avatar.ts` — avatar session lifecycle
-- Modify: `src/hooks/use-realtime.ts` — 24 kHz AudioContext, worklet tap, audio sink, mute control
+- Modify: `src/hooks/use-realtime.ts` — 24 kHz AudioContext, worklet tap, audio sink, mute control, deferred first response
 - Modify: `src/app/interview/page.tsx` — compose both hooks, fallback logic
 - Modify: `src/components/interview-view.tsx` — video centerpiece, orb fallback
 - Modify: `.env.example`, `package.json`, `CLAUDE.md` (env section)
+
+---
+
+### Task 0: Pre-integration realism check (USER CHECKPOINT)
+
+**Files:** none
+
+The spec requires judging avatar realism before integration work. This is the user's call, not the implementer's.
+
+- [ ] **Step 1: User eyeballs stock avatars**
+
+The user browses stock avatars at app.liveavatar.com (dashboard playground; the public list is also at `GET https://api.liveavatar.com/v1/avatars/public`, no auth) and decides go/no-go on HeyGen realism. On go, they record the chosen avatar UUID for `HEYGEN_AVATAR_ID`.
+
+- [ ] **Step 2: Record the decision**
+
+Note the chosen avatar ID (or "sandbox only for now") in the task notes. If realism disappoints, STOP — reassess provider (Anam is the designated runner-up) before any further tasks.
+
+*Implementation note: Tasks 1–8 may proceed in sandbox mode while the user completes this, but Task 9 Step 6 (production acceptance) is blocked on it.*
 
 ---
 
@@ -70,7 +90,7 @@ HEYGEN_SANDBOX=true
 - [ ] **Step 4: Verify install**
 
 Run: `npm run lint && npx tsc --noEmit`
-Expected: both pass (tsc has no test files yet; SDK types resolve).
+Expected: both pass (no test files yet; SDK types resolve).
 
 - [ ] **Step 5: Commit**
 
@@ -81,7 +101,38 @@ git commit -m "chore: add LiveAvatar SDK, vitest, and HeyGen env vars"
 
 ---
 
-### Task 2: PCM conversion and chunking utilities (TDD)
+### Task 2: SDK audio-path spike (decides chunk-send strategy)
+
+**Files:** none (read-only investigation; conclusions recorded in this plan's task notes)
+
+The spec requires many `agent.speak` chunks and **one** `agent.speak_end` per utterance. The SDK's documented `repeatAudio()` sends a full speak/speak_end sequence per call, which — if called once per 1 s chunk — could fragment utterances (mouth resets, gaps). Resolve this now, before the hooks are built.
+
+- [ ] **Step 1: Inspect the installed SDK**
+
+Read `node_modules/@heygen/liveavatar-web-sdk/dist/index.d.ts` and the corresponding `dist/*.js` implementation. Answer in writing:
+1. Does each `repeatAudio()` call emit its own `agent.speak_end` (i.e., one sequence per call)?
+2. Does the SDK expose any lower-level primitive to send `agent.speak` chunks and `agent.speak_end` separately (method, or an accessible WebSocket/command channel)?
+3. Are the event names/constants as assumed in this plan?
+
+- [ ] **Step 2: Choose the audio-send strategy**
+
+Decision rule, in order of preference:
+- **(a)** SDK exposes separate speak / speak-end primitives → use them: `sendAudioChunk` maps to speak, `endOfSpeech` maps to speak-end.
+- **(b)** SDK internals show consecutive `repeatAudio()` calls queue seamlessly (scheduled back-to-back without visual reset) → use `repeatAudio` per ~1 s chunk; `endOfSpeech` is a no-op.
+- **(c)** Neither provable → plan for the **raw-WS contingency** (see "Known risks" at the bottom: manual `/v1/sessions/start`, `livekit-client` for media, own `WebSocket(ws_url)` for events) and implement Task 5 against that design instead of the SDK session wrapper.
+
+Record the chosen strategy; Tasks 5–7 reference it as **THE STRATEGY**.
+
+- [ ] **Step 3: Commit (only if plan file was annotated)**
+
+```bash
+git add docs/superpowers/plans/2026-08-28-video-avatar.md
+git commit -m "docs: record LiveAvatar SDK audio-path spike decision"
+```
+
+---
+
+### Task 3: PCM conversion and chunking utilities (TDD)
 
 **Files:**
 - Create: `src/lib/pcm.ts`
@@ -235,16 +286,17 @@ git commit -m "feat: add PCM16 conversion and chunking utilities"
 
 ---
 
-### Task 3: AudioWorklet capture processor
+### Task 4: AudioWorklet capture processor
 
 **Files:**
 - Create: `public/pcm-capture-worklet.js`
 
-Plain JS (worklet scope has no bundler). It copies input channel 0 and posts it to the main thread every process() call (128 samples). Verified in-browser in Task 7; no unit test (AudioWorklet global scope isn't available in Node).
+Plain JS (worklet scope has no bundler). It copies input channel 0 and posts it to the main thread every process() call (128 samples). Verified in-browser in Task 9; no unit test (AudioWorklet global scope isn't available in Node).
 
 - [ ] **Step 1: Create `public/pcm-capture-worklet.js`**
 
 ```js
+/* global AudioWorkletProcessor, registerProcessor */
 // AudioWorklet processor: forwards mono Float32 frames to the main thread.
 // Registered as "pcm-capture"; loaded from use-realtime via audioWorklet.addModule.
 class PcmCaptureProcessor extends AudioWorkletProcessor {
@@ -264,10 +316,7 @@ registerProcessor("pcm-capture", PcmCaptureProcessor);
 - [ ] **Step 2: Verify lint passes**
 
 Run: `npm run lint`
-Expected: PASS. If ESLint complains about `AudioWorkletProcessor`/`registerProcessor` being undefined in `public/`, add at the top of the file:
-```js
-/* global AudioWorkletProcessor, registerProcessor */
-```
+Expected: PASS.
 
 - [ ] **Step 3: Commit**
 
@@ -278,12 +327,12 @@ git commit -m "feat: add AudioWorklet PCM capture processor"
 
 ---
 
-### Task 4: HeyGen session token API route
+### Task 5: HeyGen session token API route
 
 **Files:**
 - Create: `src/app/api/heygen/session/route.ts`
 
-Mirrors the pattern of `src/app/api/realtime/session/route.ts`. Sandbox mode (env `HEYGEN_SANDBOX=true`) uses the fixed free Wayne avatar. `max_session_duration` is set from the interview duration plus a 2-minute buffer so a stuck session can't burn unbounded credits.
+Mirrors the pattern of `src/app/api/realtime/session/route.ts`. Sandbox mode (env `HEYGEN_SANDBOX=true`) uses the fixed free Wayne avatar and **omits `max_session_duration`** (sandbox sessions are ~1 min and a longer request may fail tier validation). In production mode, `max_session_duration` is the clamped interview duration plus a 2-minute buffer so a stuck session can't burn unbounded credits.
 
 - [ ] **Step 1: Create the route**
 
@@ -311,8 +360,18 @@ export async function POST(request: Request) {
   }
 
   const body = await request.json();
-  const durationMinutes =
+  const requested =
     typeof body?.durationMinutes === "number" ? body.durationMinutes : 10;
+  const durationMinutes = Math.min(60, Math.max(1, requested));
+
+  const tokenConfig: Record<string, unknown> = {
+    mode: "LITE",
+    avatar_id: avatarId,
+    is_sandbox: sandbox,
+  };
+  if (!sandbox) {
+    tokenConfig.max_session_duration = (durationMinutes + 2) * 60;
+  }
 
   const response = await fetch("https://api.liveavatar.com/v1/sessions/token", {
     method: "POST",
@@ -320,12 +379,7 @@ export async function POST(request: Request) {
       "X-API-KEY": apiKey,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      mode: "LITE",
-      avatar_id: avatarId,
-      is_sandbox: sandbox,
-      max_session_duration: (durationMinutes + 2) * 60,
-    }),
+    body: JSON.stringify(tokenConfig),
   });
 
   if (!response.ok) {
@@ -365,42 +419,69 @@ git commit -m "feat: add HeyGen LiveAvatar session token route"
 
 ---
 
-### Task 5: `use-heygen-avatar` hook
+### Task 6: `use-heygen-avatar` hook
 
 **Files:**
 - Create: `src/hooks/use-heygen-avatar.ts`
 
-Owns the LiveAvatar session lifecycle. Exposes an imperative surface consumed by the interview page. Status drives UI: `"active"` renders video; `"failed"`/`"stopped"` triggers orb fallback. A 4-minute keep-alive interval guards the 5-minute idle timeout (a long user monologue produces no avatar activity).
+Owns the LiveAvatar session lifecycle. Status semantics (review finding 4): **`"active"` means the avatar's media stream is ready** (`session.stream_ready` received) — not merely that `start()` resolved. Only `"active"` renders video and mutes OpenAI audio. A 15 s watchdog fails the session if the stream never becomes ready. A 4-minute keep-alive interval guards the 5-minute idle timeout; keep-alive failures transition to `"stopped"` (fallback). Cleanup is idempotent and runs on unmount so a navigation can't leave a billable session running.
 
-**IMPORTANT for the implementer:** after `npm install`, read `node_modules/@heygen/liveavatar-web-sdk/dist/index.d.ts` and confirm the exact exported names for `LiveAvatarSession`, the config shape, event subscription API (`.on(...)`), and event name constants (`session.stream_ready`, `session.disconnected`, `session.state_changed`). The code below uses string event names per the v0.0.18 typings — adjust to enum imports if the package exports them (e.g., `SessionEvent.STREAM_READY`).
+**IMPORTANT for the implementer:** apply THE STRATEGY from Task 2. The code below assumes strategy (b) (`repeatAudio` per chunk, `endOfSpeech` no-op). For strategy (a), map `sendAudioChunk`/`endOfSpeech` to the SDK's separate speak/speak-end primitives. For strategy (c), replace the SDK session wrapper with the raw-WS design from "Known risks". Also reconcile event-name strings against the installed `.d.ts` (use enum exports if available).
 
 - [ ] **Step 1: Create the hook**
 
 ```ts
 "use client";
 
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import { LiveAvatarSession } from "@heygen/liveavatar-web-sdk";
 
 export type AvatarStatus = "idle" | "connecting" | "active" | "failed" | "stopped";
 
-const KEEP_ALIVE_MS = 4 * 60 * 1000; // idle timeout is 5 min
+const KEEP_ALIVE_MS = 4 * 60 * 1000; // provider idle timeout is 5 min
+const STREAM_READY_TIMEOUT_MS = 15_000;
 
 export function useHeygenAvatar() {
   const [status, setStatus] = useState<AvatarStatus>("idle");
   const sessionRef = useRef<LiveAvatarSession | null>(null);
   const videoElRef = useRef<HTMLVideoElement | null>(null);
   const streamReadyRef = useRef(false);
+  const stoppingRef = useRef(false); // intentional stop — ignore late disconnect events
   const keepAliveRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const watchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const teardown = useCallback(() => {
     if (keepAliveRef.current) {
       clearInterval(keepAliveRef.current);
       keepAliveRef.current = null;
     }
+    if (watchdogRef.current) {
+      clearTimeout(watchdogRef.current);
+      watchdogRef.current = null;
+    }
     streamReadyRef.current = false;
     sessionRef.current = null;
   }, []);
+
+  /** Ends the session server-side; safe to call repeatedly. */
+  const disconnect = useCallback(() => {
+    const session = sessionRef.current;
+    stoppingRef.current = true;
+    teardown();
+    session?.stop().catch(() => {});
+    setStatus("idle");
+  }, [teardown]);
+
+  // Unmount safety: never leave a billable session running.
+  useEffect(() => {
+    return () => {
+      if (sessionRef.current) {
+        stoppingRef.current = true;
+        sessionRef.current.stop().catch(() => {});
+      }
+      teardown();
+    };
+  }, [teardown]);
 
   /** Registers the <video> element; attaches immediately if the stream is ready. */
   const setVideoElement = useCallback((el: HTMLVideoElement | null) => {
@@ -411,7 +492,8 @@ export function useHeygenAvatar() {
   }, []);
 
   const connect = useCallback(
-    async (durationMinutes: number): Promise<boolean> => {
+    async (durationMinutes: number): Promise<void> => {
+      stoppingRef.current = false;
       setStatus("connecting");
       try {
         const res = await fetch("/api/heygen/session", {
@@ -426,43 +508,55 @@ export function useHeygenAvatar() {
         sessionRef.current = session;
 
         session.on("session.stream_ready", () => {
+          if (stoppingRef.current) return;
           streamReadyRef.current = true;
+          if (watchdogRef.current) {
+            clearTimeout(watchdogRef.current);
+            watchdogRef.current = null;
+          }
           if (videoElRef.current) session.attach(videoElRef.current);
+          setStatus("active"); // only now: media is attachable, OpenAI may mute
         });
         session.on("session.disconnected", () => {
-          // Covers server-side stops: NO_CREDITS, IDLE_TIMEOUT, MAX_DURATION, errors
+          if (stoppingRef.current) return;
+          // Server-side stops: NO_CREDITS, IDLE_TIMEOUT, MAX_DURATION, errors
           teardown();
           setStatus("stopped");
         });
 
         await session.start();
 
-        keepAliveRef.current = setInterval(() => {
-          sessionRef.current?.keepAlive();
-        }, KEEP_ALIVE_MS);
+        // Stream must become ready promptly or we fall back.
+        watchdogRef.current = setTimeout(() => {
+          if (!streamReadyRef.current && !stoppingRef.current) {
+            stoppingRef.current = true;
+            session.stop().catch(() => {});
+            teardown();
+            setStatus("failed");
+          }
+        }, STREAM_READY_TIMEOUT_MS);
 
-        setStatus("active");
-        return true;
+        keepAliveRef.current = setInterval(() => {
+          Promise.resolve(sessionRef.current?.keepAlive()).catch(() => {
+            teardown();
+            setStatus("stopped");
+          });
+        }, KEEP_ALIVE_MS);
       } catch (err) {
         console.error("Avatar connection failed:", err);
         teardown();
         setStatus("failed");
-        return false;
       }
     },
     [teardown],
   );
 
-  const disconnect = useCallback(() => {
-    const session = sessionRef.current;
-    teardown();
-    session?.stop().catch(() => {});
-    setStatus("idle");
-  }, [teardown]);
-
   const sendAudioChunk = useCallback((base64Pcm: string) => {
     sessionRef.current?.repeatAudio(base64Pcm);
   }, []);
+
+  /** Utterance boundary. No-op under strategy (b); sends speak-end under (a)/(c). */
+  const endOfSpeech = useCallback(() => {}, []);
 
   const interrupt = useCallback(() => {
     sessionRef.current?.interrupt();
@@ -474,6 +568,7 @@ export function useHeygenAvatar() {
     disconnect,
     setVideoElement,
     sendAudioChunk,
+    endOfSpeech,
     interrupt,
   };
 }
@@ -498,12 +593,12 @@ git commit -m "feat: add useHeygenAvatar hook for LiveAvatar session lifecycle"
 
 ---
 
-### Task 6: Audio sink in `use-realtime`
+### Task 7: Audio sink and deferred first response in `use-realtime`
 
 **Files:**
 - Modify: `src/hooks/use-realtime.ts`
 
-Adds: (a) a 24 kHz AudioContext + worklet tap on the OpenAI remote track, (b) an attachable audio sink gated by the `output_audio_buffer.*` data-channel events, (c) output mute control. When no sink is attached, behavior is exactly today's.
+Adds: (a) an **optional** 24 kHz AudioContext + worklet tap on the OpenAI remote track — set up in an isolated try/catch so bridge failure can never break the voice interview (review finding 2), with the worklet kept alive through a zero-gain branch to the destination (finding 5); (b) an attachable audio sink gated by the `output_audio_buffer.*` data-channel events; (c) output mute control; (d) the initial `response.create` moved out of `dc.onopen` into an idempotent `startConversation()` so the page can defer the first response until the avatar settles (finding 4). When no sink is attached and no `startConversation` deferral is used, behavior matches today's.
 
 - [ ] **Step 1: Add the sink type and refs**
 
@@ -514,30 +609,49 @@ import { PcmChunker } from "@/lib/pcm";
 /** Receives the interviewer's audio as base64 PCM16 24 kHz chunks. */
 export interface RealtimeAudioSink {
   onAudioChunk: (base64Pcm: string) => void;
+  onSpeechEnd: () => void;
   onInterrupt: () => void;
 }
 ```
 
-Inside `useRealtime()`, alongside the existing refs, add:
+Inside `useRealtime()`, alongside the existing refs and state, add:
 ```ts
+const [bridgeAvailable, setBridgeAvailable] = useState<boolean | null>(null);
 const sinkRef = useRef<RealtimeAudioSink | null>(null);
 const chunkerRef = useRef<PcmChunker | null>(null);
 const workletRef = useRef<AudioWorkletNode | null>(null);
+const workletReadyRef = useRef(false);
 const aiSpeakingRef = useRef(false);
+const conversationStartedRef = useRef(false);
 ```
 
-- [ ] **Step 2: Create the AudioContext at 24 kHz and load the worklet in `connect`**
+- [ ] **Step 2: Set up the audio bridge — isolated, optional**
 
-In `connect`, replace the AudioContext creation inside `pc.ontrack` with a context created up front (before step "2. Create peer connection" in the existing numbered comments), so the worklet module is loaded before audio arrives:
+In `connect`, after fetching the client secret and before creating the peer connection, add:
 
 ```ts
-// 1.5 Audio context at 24 kHz (OpenAI Realtime output rate) + capture worklet
-const ctx = new AudioContext({ sampleRate: 24000 });
-await ctx.audioWorklet.addModule("/pcm-capture-worklet.js");
-audioCtxRef.current = ctx;
+// 1.5 Audio bridge (optional): 24 kHz context + capture worklet for the avatar.
+// Failure here must never break the voice interview — degrade to voice-only.
+workletReadyRef.current = false;
+try {
+  const ctx = new AudioContext({ sampleRate: 24000 });
+  if (ctx.state === "suspended") await ctx.resume();
+  if (ctx.sampleRate !== 24000) {
+    throw new Error(`AudioContext rate ${ctx.sampleRate}, need 24000`);
+  }
+  await ctx.audioWorklet.addModule("/pcm-capture-worklet.js");
+  audioCtxRef.current = ctx;
+  workletReadyRef.current = true;
+  setBridgeAvailable(true);
+} catch (err) {
+  console.warn("Avatar audio bridge unavailable, voice-only mode:", err);
+  audioCtxRef.current?.close();
+  audioCtxRef.current = new AudioContext(); // analyser-only fallback, default rate
+  setBridgeAvailable(false);
+}
 ```
 
-Then in `pc.ontrack`, use `audioCtxRef.current` instead of `new AudioContext()`, and after wiring the analyser add the worklet tap:
+Then in `pc.ontrack`, use `audioCtxRef.current` instead of creating a new context, and add the worklet tap after the analyser wiring:
 
 ```ts
 pc.ontrack = (e) => {
@@ -552,18 +666,26 @@ pc.ontrack = (e) => {
   source.connect(analyser);
   analyserRef.current = analyser;
 
-  // Tap for the avatar audio sink: 1 s chunks of PCM16 @ 24 kHz
-  const worklet = new AudioWorkletNode(ctx, "pcm-capture");
-  chunkerRef.current = new PcmChunker(24000, (b64) => {
-    sinkRef.current?.onAudioChunk(b64);
-  });
-  worklet.port.onmessage = (msg: MessageEvent<Float32Array>) => {
-    if (sinkRef.current && aiSpeakingRef.current) {
-      chunkerRef.current?.push(msg.data);
-    }
-  };
-  source.connect(worklet);
-  workletRef.current = worklet;
+  if (workletReadyRef.current) {
+    // Tap for the avatar audio sink: 1 s chunks of PCM16 @ 24 kHz.
+    const worklet = new AudioWorkletNode(ctx, "pcm-capture");
+    chunkerRef.current = new PcmChunker(24000, (b64) => {
+      sinkRef.current?.onAudioChunk(b64);
+    });
+    worklet.port.onmessage = (msg: MessageEvent<Float32Array>) => {
+      if (sinkRef.current && aiSpeakingRef.current) {
+        chunkerRef.current?.push(msg.data);
+      }
+    };
+    // Zero-gain branch to the destination keeps the worklet processing
+    // without audibly doubling the audio element's playback.
+    const silent = ctx.createGain();
+    silent.gain.value = 0;
+    source.connect(worklet);
+    worklet.connect(silent);
+    silent.connect(ctx.destination);
+    workletRef.current = worklet;
+  }
 
   const dataArray = new Uint8Array(analyser.frequencyBinCount);
   function tick() { /* ...existing tick body unchanged... */ }
@@ -572,9 +694,24 @@ pc.ontrack = (e) => {
 ```
 (The existing `tick` body and rAF wiring stay exactly as they are.)
 
-Note: `connect` already runs inside a user gesture (Begin Interview click), so the AudioContext starts unsuspended. If `ctx.state === "suspended"`, call `ctx.resume()` after creation.
+- [ ] **Step 3: Move the initial response out of `dc.onopen`**
 
-- [ ] **Step 3: Gate the sink with output_audio_buffer events**
+In `dc.onopen`, delete the line `dc.send(JSON.stringify({ type: "response.create" }));` (the wrap-up timeout wiring stays). Add alongside the other callbacks:
+
+```ts
+/**
+ * Sends the initial response.create. Idempotent — the page calls this once
+ * the avatar has settled (active/failed/stopped) or a deadline passes.
+ */
+const startConversation = useCallback(() => {
+  const dc = dcRef.current;
+  if (!dc || dc.readyState !== "open" || conversationStartedRef.current) return;
+  conversationStartedRef.current = true;
+  dc.send(JSON.stringify({ type: "response.create" }));
+}, []);
+```
+
+- [ ] **Step 4: Gate the sink with output_audio_buffer events**
 
 In `handleServerEvent`, add cases:
 ```ts
@@ -586,6 +723,7 @@ case "output_audio_buffer.started": {
 case "output_audio_buffer.stopped": {
   aiSpeakingRef.current = false;
   chunkerRef.current?.flush(); // send the final partial chunk
+  sinkRef.current?.onSpeechEnd();
   break;
 }
 
@@ -597,9 +735,9 @@ case "output_audio_buffer.cleared": {
   break;
 }
 ```
-Note: `handleServerEvent` is currently a plain function declared inside the hook body — these refs are in scope; no signature change needed.
+Note: `handleServerEvent` is a plain function declared inside the hook body — these refs are in scope; no signature change needed.
 
-- [ ] **Step 4: Expose sink attach and mute controls**
+- [ ] **Step 5: Expose sink attach and mute controls; extend cleanup**
 
 Add before the return statement:
 ```ts
@@ -623,7 +761,9 @@ if (workletRef.current) {
 }
 chunkerRef.current = null;
 sinkRef.current = null;
+workletReadyRef.current = false;
 aiSpeakingRef.current = false;
+conversationStartedRef.current = false;
 ```
 
 And extend the hook's return object:
@@ -634,40 +774,40 @@ return {
   status,
   transcripts,
   audioLevel,
+  bridgeAvailable,
+  startConversation,
   setAudioSink,
   setOutputMuted,
 };
 ```
 
-- [ ] **Step 5: Verify**
+- [ ] **Step 6: Verify**
 
 Run: `npm run lint && npx tsc --noEmit && npx vitest run`
 Expected: all PASS.
-
-- [ ] **Step 6: Manual regression — voice-only still works**
-
-Run `npm run dev`, start an interview with no HeyGen wiring yet (nothing consumes the sink): confirm the interviewer speaks, the orb reacts, transcripts appear. This proves the refactor didn't break the existing path.
 
 - [ ] **Step 7: Commit**
 
 ```bash
 git add src/hooks/use-realtime.ts
-git commit -m "feat: add avatar audio sink tap to realtime hook"
+git commit -m "feat: add avatar audio sink tap and deferred first response to realtime hook"
 ```
+
+(Manual voice-only regression happens in the next task once the page calls `startConversation` — until then the page still expects the old auto-start, so don't run the app between Tasks 7 and 8.)
 
 ---
 
-### Task 7: Wire avatar into the interview page and view
+### Task 8: Wire avatar into the interview page and view
 
 **Files:**
 - Modify: `src/app/interview/page.tsx`
 - Modify: `src/components/interview-view.tsx`
 
-Composition rules: avatar connects in parallel with the OpenAI session at Begin. When avatar is `active`: sink attached + OpenAI audio muted + video rendered. On `failed`/`stopped`: sink detached + audio unmuted + orb rendered + quiet notice. Interview end tears down both.
+Composition rules: avatar connects in parallel with the OpenAI session at Begin. Only when avatar is `active` (stream ready): sink attached + OpenAI audio muted + video rendered. On `failed`/`stopped` or bridge unavailable: sink detached + audio unmuted + orb rendered + quiet notice. The first AI response fires when the avatar settles or after a 10 s deadline. Interview end tears down both. Callbacks are destructured so unstable hook-object identity can't churn the view's timer effect (review finding 8).
 
 - [ ] **Step 1: Compose hooks in `src/app/interview/page.tsx`**
 
-Replace the component body wiring (keep `useSessionConfig` as is):
+Replace the component body wiring (keep `useSessionConfig` exactly as is):
 ```tsx
 "use client";
 
@@ -680,6 +820,8 @@ import type { InterviewConfig } from "@/lib/types";
 
 // ...useSessionConfig unchanged...
 
+const AVATAR_START_DEADLINE_MS = 10_000;
+
 export default function InterviewPage() {
   const router = useRouter();
   const config = useSessionConfig();
@@ -689,10 +831,20 @@ export default function InterviewPage() {
     status,
     transcripts,
     audioLevel,
+    bridgeAvailable,
+    startConversation,
     setAudioSink,
     setOutputMuted,
   } = useRealtime();
-  const avatar = useHeygenAvatar();
+  const {
+    status: avatarStatus,
+    connect: connectAvatar,
+    disconnect: disconnectAvatar,
+    setVideoElement,
+    sendAudioChunk,
+    endOfSpeech,
+    interrupt,
+  } = useHeygenAvatar();
 
   useEffect(() => {
     if (!config) {
@@ -700,34 +852,55 @@ export default function InterviewPage() {
     }
   }, [config, router]);
 
-  // Route interviewer audio to the avatar while it is active; fall back otherwise.
+  // Without the audio bridge the avatar can never receive audio — shut it down.
   useEffect(() => {
-    if (avatar.status === "active") {
+    if (bridgeAvailable === false && (avatarStatus === "connecting" || avatarStatus === "active")) {
+      disconnectAvatar();
+    }
+  }, [bridgeAvailable, avatarStatus, disconnectAvatar]);
+
+  // Route interviewer audio to the avatar only while its stream is live.
+  useEffect(() => {
+    if (avatarStatus === "active" && bridgeAvailable) {
       setAudioSink({
-        onAudioChunk: avatar.sendAudioChunk,
-        onInterrupt: avatar.interrupt,
+        onAudioChunk: sendAudioChunk,
+        onSpeechEnd: endOfSpeech,
+        onInterrupt: interrupt,
       });
       setOutputMuted(true);
     } else {
       setAudioSink(null);
       setOutputMuted(false);
     }
-  }, [avatar.status, avatar.sendAudioChunk, avatar.interrupt, setAudioSink, setOutputMuted]);
+  }, [avatarStatus, bridgeAvailable, sendAudioChunk, endOfSpeech, interrupt, setAudioSink, setOutputMuted]);
+
+  // First AI response: wait for the avatar to settle, capped by a deadline.
+  const avatarSettled =
+    avatarStatus === "active" || avatarStatus === "failed" || avatarStatus === "stopped";
+  useEffect(() => {
+    if (status !== "connected") return;
+    if (avatarSettled || bridgeAvailable === false) {
+      startConversation();
+      return;
+    }
+    const t = setTimeout(startConversation, AVATAR_START_DEADLINE_MS);
+    return () => clearTimeout(t);
+  }, [status, avatarSettled, bridgeAvailable, startConversation]);
 
   const handleConnect = useCallback(
     (cfg: InterviewConfig) => {
       connect(cfg);
-      avatar.connect(cfg.durationMinutes); // parallel; failure just means orb fallback
+      connectAvatar(cfg.durationMinutes); // parallel; failure just means orb fallback
     },
-    [connect, avatar],
+    [connect, connectAvatar],
   );
 
   const handleEnd = useCallback(() => {
-    avatar.disconnect();
+    disconnectAvatar();
     disconnect();
     sessionStorage.setItem("interviewTranscript", JSON.stringify(transcripts));
     router.push("/feedback");
-  }, [avatar, disconnect, transcripts, router]);
+  }, [disconnectAvatar, disconnect, transcripts, router]);
 
   if (!config) return null;
 
@@ -737,8 +910,8 @@ export default function InterviewPage() {
       status={status}
       transcripts={transcripts}
       audioLevel={audioLevel}
-      avatarStatus={avatar.status}
-      onVideoElement={avatar.setVideoElement}
+      avatarStatus={avatarStatus}
+      onVideoElement={setVideoElement}
       onConnect={handleConnect}
       onEnd={handleEnd}
     />
@@ -788,7 +961,11 @@ Note: `ref={onVideoElement}` works because React callback refs receive the eleme
 Run: `npm run lint && npx tsc --noEmit && npm run build`
 Expected: all PASS.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 4: Manual regression — voice-only still works**
+
+Run `npm run dev` **without** `HEYGEN_API_KEY` in `.env.local` (or with the avatar route unreachable): start an interview. Confirm: the interviewer speaks (first response arrives after the avatar fails or the 10 s deadline), the orb reacts, transcripts appear, wrap-up timing unaffected. This proves the primary voice path survived the refactor.
+
+- [ ] **Step 5: Commit**
 
 ```bash
 git add src/app/interview/page.tsx src/components/interview-view.tsx
@@ -797,11 +974,11 @@ git commit -m "feat: render video avatar interviewer with orb fallback"
 
 ---
 
-### Task 8: Update project docs
+### Task 9: Update project docs
 
 **Files:**
 - Modify: `CLAUDE.md` (Environment + Architecture sections)
-- Modify: `README.md` (env var table/section, if one exists — check first)
+- Modify: `README.md` (env var section, if one exists — check first)
 
 - [ ] **Step 1: Update `CLAUDE.md`**
 
@@ -829,37 +1006,49 @@ git commit -m "docs: document HeyGen video avatar env vars and architecture"
 
 ---
 
-### Task 9: End-to-end verification
+### Task 10: End-to-end verification
 
 **Files:** none (verification only)
 
 Prereqs: `HEYGEN_API_KEY` set in `.env.local`, `HEYGEN_SANDBOX=true` (free sandbox sessions, ~1 min, Wayne avatar — enough to verify plumbing without burning credits).
 
-- [ ] **Step 1: Playwright — fallback path (no HeyGen key)**
+- [ ] **Step 1: Playwright — fallback path (no env mutation)**
 
-Temporarily comment out `HEYGEN_API_KEY` in `.env.local`, run `npm run dev`, and with the Playwright CLI: load the app, fill the setup form, begin an interview. Verify: interview connects, orb renders (not video), the "Video unavailable" note appears, interviewer audio is audible. Restore the key after.
+Run `npm run dev`. Using the Playwright CLI, intercept the avatar route to force failure — do NOT edit `.env.local`:
+```js
+await page.route("**/api/heygen/session", (r) =>
+  r.fulfill({ status: 500, contentType: "application/json", body: "{}" }),
+);
+```
+Then load the app, fill the setup form, begin an interview. Verify: OpenAI connects, the orb renders (not video), the "Video unavailable" note appears, interviewer audio is audible (unmuted).
 
 - [ ] **Step 2: Playwright — video path (sandbox)**
 
-With the key restored and `HEYGEN_SANDBOX=true`: begin an interview. Verify: a `<video>` element appears with a playing stream (Wayne avatar), his lips move when the interviewer speaks, OpenAI's direct audio is muted (no doubled voice). Expect the sandbox session to self-terminate after ~1 min — verify the UI falls back to the orb and the interview continues (this doubles as the mid-session-drop fallback test).
+Without interception and with `HEYGEN_SANDBOX=true`: begin an interview. Verify: a `<video>` element appears with a playing stream (Wayne avatar), lips move when the interviewer speaks, no doubled voice (OpenAI element muted), and chunks flow (add a temporary `console.log` in the sink if needed; remove after). Also confirm in the console that `AudioContext.sampleRate` is 24000.
 
-- [ ] **Step 3: Barge-in check**
+- [ ] **Step 3: Mid-session drop fallback**
 
-During an avatar response, interrupt by speaking. Verify the avatar stops talking within ~a second (the `interrupt()` path).
+Let the sandbox session hit its ~1-minute auto-termination. Verify the UI swaps to the orb, OpenAI audio unmutes, the notice appears, and the interview continues.
 
-- [ ] **Step 4: Full suite**
+- [ ] **Step 4: Barge-in check**
+
+During an avatar response, interrupt by speaking. Verify the avatar stops talking within ~a second (the `interrupt()` path) and no stale audio plays later (chunker discarded).
+
+- [ ] **Step 5: Full suite**
 
 Run: `npm run lint && npx tsc --noEmit && npx vitest run && npm run build`
 Expected: all PASS.
 
-- [ ] **Step 5: Human acceptance (user)**
+- [ ] **Step 6: Human acceptance (user; requires Task 0 go decision)**
 
-With a real avatar ID (`HEYGEN_SANDBOX=false`) and paid/trial credits, the user runs a ~5-minute real interview and judges: realism, lip-sync quality, added latency, barge-in feel. This is the spec's true acceptance test.
+With the user's chosen avatar ID (`HEYGEN_SANDBOX=false`) and trial/paid credits, the user runs a ~5-minute real interview and judges: realism, lip-sync quality, added latency, barge-in feel. This is the spec's true acceptance test.
 
-- [ ] **Step 6: Commit any fixes**
+- [ ] **Step 7: Commit any fixes — explicit staging only**
 
+Run `git status --short` and `git diff` to review. Stage ONLY files you changed for verification fixes, by name (never `git add -A`):
 ```bash
-git add -A && git commit -m "fix: address issues found in end-to-end verification"
+git add <specific files>
+git commit -m "fix: address issues found in end-to-end verification"
 ```
 (Only if fixes were needed.)
 
@@ -867,6 +1056,6 @@ git add -A && git commit -m "fix: address issues found in end-to-end verificatio
 
 ## Known risks & mitigations
 
-- **`repeatAudio` per-1s-chunk may introduce micro-gaps** between chunks (each call sends its own `agent.speak`/`agent.speak_end` sequence). If audible/visible choppiness appears in Task 9: first try larger chunks (2–3 s — still ≪ 1 MB); if still choppy, switch from the SDK's `repeatAudio` to a raw `WebSocket(ws_url)` sending `agent.speak` per chunk and a single `agent.speak_end` at `output_audio_buffer.stopped` (the hook already has that boundary signal — pass it through the sink as an `onSpeechEnd` callback).
-- **SDK is v0.0.x** — pin the exact installed version in `package.json` and expect the implementer to reconcile event names against the installed `.d.ts` (called out in Task 5).
-- **Avatar connects after the AI's first sentence has started** — the first response may begin on the orb/unmuted audio and switch to the avatar mid-utterance. Acceptable for v1; noted so it isn't mistaken for a bug.
+- **Chunked sends may fragment utterances** (Task 2 decides the strategy). If sandbox testing in Task 10 still shows gaps or mouth resets: first try larger chunks (2–3 s — still ≪ 1 MB); if still choppy, implement the **raw-WS contingency**: skip the SDK session wrapper; call `POST /v1/sessions/start` (Bearer session token) yourself to get `livekit_url`, `livekit_client_token`, and `ws_url`; join the room with `livekit-client` and attach the avatar participant's tracks; open `WebSocket(ws_url)`, wait for `session.state_updated: "connected"`, then send `{"type":"agent.speak","audio":<b64>}` per chunk, one `{"type":"agent.speak_end"}` from `onSpeechEnd`, and `{"type":"agent.interrupt"}` on barge-in; keep-alive via `{"type":"session.keep_alive"}`. The hook's public surface (`sendAudioChunk`/`endOfSpeech`/`interrupt`) already matches this shape.
+- **SDK is v0.0.x** — pin the exact installed version in `package.json`; Task 2/6 reconcile names against the installed `.d.ts`.
+- **First-response delay** — deferring `response.create` until the avatar settles adds up to ~10 s before the interviewer's greeting when the avatar is slow. Acceptable trade-off (spec-amended); the deadline caps it.
