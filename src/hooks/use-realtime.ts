@@ -6,11 +6,22 @@ import type {
   ConnectionStatus,
   TranscriptEntry,
 } from "@/lib/types";
+import { PcmChunker } from "@/lib/pcm";
+
+/** Receives the interviewer's audio as base64 PCM16 24 kHz chunks. */
+export interface RealtimeAudioSink {
+  onAudioChunk: (base64Pcm: string) => void;
+  onSpeechEnd: () => void;
+  onInterrupt: () => void;
+}
 
 export function useRealtime() {
   const [status, setStatus] = useState<ConnectionStatus>("idle");
   const [transcripts, setTranscripts] = useState<TranscriptEntry[]>([]);
   const [audioLevel, setAudioLevel] = useState(0);
+  const [bridgeAvailable, setBridgeAvailable] = useState<boolean | null>(
+    null,
+  );
 
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const dcRef = useRef<RTCDataChannel | null>(null);
@@ -21,6 +32,12 @@ export function useRealtime() {
   const rafRef = useRef<number | null>(null);
   const wrapUpTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const aiTranscriptBuffer = useRef("");
+  const sinkRef = useRef<RealtimeAudioSink | null>(null);
+  const chunkerRef = useRef<PcmChunker | null>(null);
+  const workletRef = useRef<AudioWorkletNode | null>(null);
+  const workletReadyRef = useRef(false);
+  const aiSpeakingRef = useRef(false);
+  const conversationStartedRef = useRef(false);
 
   function handleServerEvent(event: Record<string, unknown>) {
     switch (event.type) {
@@ -59,6 +76,26 @@ export function useRealtime() {
         aiTranscriptBuffer.current = "";
         break;
       }
+
+      case "output_audio_buffer.started": {
+        aiSpeakingRef.current = true;
+        break;
+      }
+
+      case "output_audio_buffer.stopped": {
+        aiSpeakingRef.current = false;
+        chunkerRef.current?.flush(); // send the final partial chunk
+        sinkRef.current?.onSpeechEnd();
+        break;
+      }
+
+      case "output_audio_buffer.cleared": {
+        // User barge-in: drop buffered audio and stop the avatar's mouth
+        aiSpeakingRef.current = false;
+        chunkerRef.current?.discard();
+        sinkRef.current?.onInterrupt();
+        break;
+      }
     }
   }
 
@@ -92,6 +129,16 @@ export function useRealtime() {
       audioRef.current.srcObject = null;
       audioRef.current = null;
     }
+    if (workletRef.current) {
+      workletRef.current.port.onmessage = null;
+      workletRef.current.disconnect();
+      workletRef.current = null;
+    }
+    chunkerRef.current = null;
+    sinkRef.current = null;
+    workletReadyRef.current = false;
+    aiSpeakingRef.current = false;
+    conversationStartedRef.current = false;
     setAudioLevel(0);
   }, []);
 
@@ -117,6 +164,27 @@ export function useRealtime() {
         if (!res.ok) throw new Error("Failed to get session token");
         const { client_secret } = await res.json();
 
+        // 1.5 Audio bridge (optional): 24 kHz context + capture worklet for the avatar.
+        // Failure here must never break the voice interview — degrade to voice-only.
+        workletReadyRef.current = false;
+        let ctx: AudioContext | undefined;
+        try {
+          ctx = new AudioContext({ sampleRate: 24000 });
+          if (ctx.state === "suspended") await ctx.resume();
+          if (ctx.sampleRate !== 24000) {
+            throw new Error(`AudioContext rate ${ctx.sampleRate}, need 24000`);
+          }
+          await ctx.audioWorklet.addModule("/pcm-capture-worklet.js");
+          audioCtxRef.current = ctx;
+          workletReadyRef.current = true;
+          setBridgeAvailable(true);
+        } catch (err) {
+          console.warn("Avatar audio bridge unavailable, voice-only mode:", err);
+          ctx?.close();
+          audioCtxRef.current = new AudioContext(); // analyser-only fallback, default rate
+          setBridgeAvailable(false);
+        }
+
         // 2. Create peer connection
         const pc = new RTCPeerConnection();
         pcRef.current = pc;
@@ -130,14 +198,34 @@ export function useRealtime() {
           audio.srcObject = remoteStream;
 
           // Wire up Web Audio analyser for volume metering
-          const ctx = new AudioContext();
+          const ctx = audioCtxRef.current!;
           const source = ctx.createMediaStreamSource(remoteStream);
           const analyser = ctx.createAnalyser();
           analyser.fftSize = 256;
           analyser.smoothingTimeConstant = 0.5;
           source.connect(analyser);
-          audioCtxRef.current = ctx;
           analyserRef.current = analyser;
+
+          if (workletReadyRef.current) {
+            // Tap for the avatar audio sink: 1 s chunks of PCM16 @ 24 kHz.
+            const worklet = new AudioWorkletNode(ctx, "pcm-capture");
+            chunkerRef.current = new PcmChunker(24000, (b64) => {
+              sinkRef.current?.onAudioChunk(b64);
+            });
+            worklet.port.onmessage = (msg: MessageEvent<Float32Array>) => {
+              if (sinkRef.current && aiSpeakingRef.current) {
+                chunkerRef.current?.push(msg.data);
+              }
+            };
+            // Zero-gain branch to the destination keeps the worklet processing
+            // without audibly doubling the audio element's playback.
+            const silent = ctx.createGain();
+            silent.gain.value = 0;
+            source.connect(worklet);
+            worklet.connect(silent);
+            silent.connect(ctx.destination);
+            workletRef.current = worklet;
+          }
 
           const dataArray = new Uint8Array(analyser.frequencyBinCount);
           function tick() {
@@ -165,7 +253,6 @@ export function useRealtime() {
 
         dc.onopen = () => {
           setStatus("connected");
-          dc.send(JSON.stringify({ type: "response.create" }));
 
           const wrapUpMs = Math.max(0, (config.durationMinutes - 2) * 60_000);
           wrapUpTimeoutRef.current = setTimeout(() => {
@@ -228,11 +315,37 @@ export function useRealtime() {
     setStatus("idle");
   }, [cleanup]);
 
+  /**
+   * Sends the initial response.create. Idempotent — the page calls this once
+   * the avatar has settled (active/failed/stopped) or a deadline passes.
+   */
+  const startConversation = useCallback(() => {
+    const dc = dcRef.current;
+    if (!dc || dc.readyState !== "open" || conversationStartedRef.current)
+      return;
+    conversationStartedRef.current = true;
+    dc.send(JSON.stringify({ type: "response.create" }));
+  }, []);
+
+  /** Attach/detach the avatar audio sink. Muting the local element is separate. */
+  const setAudioSink = useCallback((sink: RealtimeAudioSink | null) => {
+    sinkRef.current = sink;
+  }, []);
+
+  /** Mute/unmute the local OpenAI audio playback (avatar plays its own synced audio). */
+  const setOutputMuted = useCallback((muted: boolean) => {
+    if (audioRef.current) audioRef.current.muted = muted;
+  }, []);
+
   return {
     connect,
     disconnect,
     status,
     transcripts,
     audioLevel,
+    bridgeAvailable,
+    startConversation,
+    setAudioSink,
+    setOutputMuted,
   };
 }
