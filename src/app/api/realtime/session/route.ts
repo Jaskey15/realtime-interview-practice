@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { buildInterviewerPrompt, getInterviewerVoice } from "@/lib/prompts";
+import { buildInterviewerPrompt } from "@/lib/prompts";
+import { resolveInterviewer, toInterviewType } from "@/lib/interviewers";
 
 export async function POST(request: Request) {
   const apiKey = process.env.OPENAI_API_KEY;
@@ -12,6 +13,7 @@ export async function POST(request: Request) {
 
   const body = await request.json();
   const { jobDescription, focusPrompt, interviewType, interviewerStyle, durationMinutes } = body;
+  const type = toInterviewType(interviewType);
 
   if (!jobDescription || typeof jobDescription !== "string") {
     return NextResponse.json(
@@ -23,7 +25,7 @@ export async function POST(request: Request) {
   const instructions = buildInterviewerPrompt({
     jobDescription,
     focusPrompt: focusPrompt || "",
-    interviewType: interviewType || "technical",
+    interviewType: type,
     interviewerStyle: interviewerStyle || "neutral",
     durationMinutes: durationMinutes || 10,
   });
@@ -51,7 +53,7 @@ export async function POST(request: Request) {
               },
             },
             output: {
-              voice: getInterviewerVoice(interviewType || "technical"),
+              voice: resolveInterviewer(type).voice,
             },
           },
         },

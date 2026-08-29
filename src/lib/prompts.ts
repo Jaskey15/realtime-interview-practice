@@ -1,4 +1,5 @@
 import type { InterviewConfig, InterviewType, InterviewerStyle } from "./types";
+import { resolveInterviewer } from "./interviewers";
 
 const TYPE_BLOCKS: Record<InterviewType, string> = {
   technical:
@@ -20,13 +21,6 @@ const STYLE_BLOCKS: Record<InterviewerStyle, string> = {
     "Push back on answers. Ask \"are you sure?\" Probe for weaknesses and gaps. Provide less validation. Test how the candidate performs under pressure.",
 };
 
-const PERSONA_MAP: Record<InterviewType, { name: string; title: string }> = {
-  technical: { name: "Alex", title: "Senior Engineer" },
-  behavioral: { name: "Jordan", title: "Hiring Manager" },
-  "case-study": { name: "Morgan", title: "Senior Consultant" },
-  general: { name: "Taylor", title: "Hiring Manager" },
-};
-
 export function buildInterviewerPrompt(config: InterviewConfig): string {
   const {
     jobDescription,
@@ -36,7 +30,7 @@ export function buildInterviewerPrompt(config: InterviewConfig): string {
     durationMinutes,
   } = config;
 
-  const persona = PERSONA_MAP[interviewType];
+  const persona = resolveInterviewer(interviewType);
 
   const sections = [
     // Base instructions
@@ -72,15 +66,4 @@ Weight your questions toward this area while still covering general competency.`
   }
 
   return sections.join("\n\n");
-}
-
-export function getInterviewerVoice(interviewType: InterviewType): string {
-  switch (interviewType) {
-    case "technical":
-    case "behavioral":
-      return "cedar";
-    case "case-study":
-    case "general":
-      return "marin";
-  }
 }
