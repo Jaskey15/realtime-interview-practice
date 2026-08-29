@@ -95,6 +95,20 @@
     }
   }
 
+  /* Waiting-state pulse for the interviewer portrait. Distinct from
+     atmosphere-breathe, whose translate(-50%, -50%) is specific to the
+     centred ambient glow and would knock the portrait off-centre. */
+  @keyframes portrait-pulse {
+    0%, 100% {
+      opacity: 0.75;
+      transform: scale(1);
+    }
+    50% {
+      opacity: 1;
+      transform: scale(1.04);
+    }
+  }
+
   @keyframes shimmer {
     0% { background-position: -200% center; }
     100% { background-position: 200% center; }
