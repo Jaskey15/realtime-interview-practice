@@ -1,11 +1,28 @@
 "use client";
 
+import { useMemo, useSyncExternalStore } from "react";
 import { useRouter } from "next/navigation";
 import { SetupForm } from "@/components/setup-form";
 import type { InterviewConfig } from "@/lib/types";
 
+// sessionStorage is client-only, so read it through useSyncExternalStore: the
+// server snapshot is empty and the real value arrives right after hydration.
+const subscribeToStorage = () => () => {};
+const getStoredConfig = () => sessionStorage.getItem("interviewConfig");
+const getServerConfig = () => null;
+
 export default function Home() {
   const router = useRouter();
+  const stored = useSyncExternalStore(subscribeToStorage, getStoredConfig, getServerConfig);
+
+  const initialConfig = useMemo<InterviewConfig | null>(() => {
+    if (!stored) return null;
+    try {
+      return JSON.parse(stored) as InterviewConfig;
+    } catch {
+      return null;
+    }
+  }, [stored]);
 
   function handleStart(config: InterviewConfig) {
     sessionStorage.setItem("interviewConfig", JSON.stringify(config));
@@ -32,7 +49,12 @@ export default function Home() {
           Paste a job description, practice a live interview, get AI feedback.
         </p>
       </div>
-      <SetupForm onStart={handleStart} />
+      {/* keyed so the form picks up the stored config once hydration resolves it */}
+      <SetupForm
+        key={initialConfig ? "prefilled" : "empty"}
+        onStart={handleStart}
+        initialConfig={initialConfig}
+      />
     </main>
   );
 }

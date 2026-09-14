@@ -27,14 +27,16 @@ const focusPlaceholders: Record<InterviewType, string> = {
 
 export function SetupForm({
   onStart,
+  initialConfig,
 }: {
   onStart: (config: InterviewConfig) => void;
+  initialConfig?: InterviewConfig | null;
 }) {
-  const [jobDescription, setJobDescription] = useState("");
-  const [focusPrompt, setFocusPrompt] = useState("");
-  const [interviewType, setInterviewType] = useState<InterviewType>("technical");
-  const [interviewerStyle, setInterviewerStyle] = useState<InterviewerStyle>("neutral");
-  const [durationMinutes, setDurationMinutes] = useState(10);
+  const [jobDescription, setJobDescription] = useState(initialConfig?.jobDescription ?? "");
+  const [focusPrompt, setFocusPrompt] = useState(initialConfig?.focusPrompt ?? "");
+  const [interviewType, setInterviewType] = useState<InterviewType>(initialConfig?.interviewType ?? "technical");
+  const [interviewerStyle, setInterviewerStyle] = useState<InterviewerStyle>(initialConfig?.interviewerStyle ?? "neutral");
+  const [durationMinutes, setDurationMinutes] = useState(initialConfig?.durationMinutes ?? 10);
 
   const canStart = jobDescription.trim().length > 0;
 

@@ -103,8 +103,8 @@ export default function FeedbackPage() {
           router.push("/interview");
         }}
         onNewInterview={() => {
+          // Keep interviewConfig so the setup form prefills the same job description
           sessionStorage.removeItem("interviewTranscript");
-          sessionStorage.removeItem("interviewConfig");
           router.push("/");
         }}
       />
